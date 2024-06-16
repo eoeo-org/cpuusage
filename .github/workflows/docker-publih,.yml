@@ -1,0 +1,133 @@
+name: build
+on:
+  push:
+    branches: ["**"]
+    tags: [v*.*.*]
+  pull_request:
+  workflow_call:
+    inputs:
+      tag-name:
+        required: true
+        type: string
+    outputs:
+      image_tags:
+        value: ${{ jobs.docker.outputs.image_tags }}
+      image_url:
+        value: https://ghcr.io/${{ github.repository }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  BINARY_NAME: ${{ github.event.repository.name }}
+
+  # renovate: datasource=github-releases depName=docker/buildx
+  BUILDX_VERSION: v0.15.0
+
+jobs:
+  build:
+    if: ${{ !( github.workflow == 'build' && startsWith(github.event.head_commit.message, 'release:') && github.event.head_commit.author.name == 'github-actions[bot]' ) }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl]
+        use-cross: [true]
+        include:
+          - target: x86_64-unknown-linux-gnu
+            use-cross: false
+          - target: x86_64-unknown-linux-musl
+            use-cross: false
+    runs-on: ${{ matrix.os || 'ubuntu-latest'}}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    defaults:
+      run:
+        shell: bash -xe {0}
+    steps:
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get install -y musl-tools --no-install-recommends
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84 # v2.7.3
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross
+        if: ${{ !matrix.os && matrix.use-cross }}
+        uses: taiki-e/install-action@47943d5b8d7736809817cbcd80f31e7c7d6538ad # v2.39.1
+        with:
+          tool: cross
+      - run: mkdir dist
+      - run: ${{ (!matrix.os && matrix.use-cross) && 'cross' || 'cargo' }} rustc --locked --release --target=${{ matrix.target }} -- --emit=link=dist/cpuusage
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/cpuusage
+      - name: Upload to release
+        if: ${{ inputs.tag-name }}
+        working-directory: dist/
+        run: |
+          filename="${{ env.BINARY_NAME }}-${{ inputs.tag-name }}-${{ matrix.target }}"
+          mv cpuusage "$filename"
+          gh release upload ${{ inputs.tag-name }} "$filename"#${{ matrix.target }} --clobber
+  docker:
+    needs: build
+    permissions:
+      packages: write
+    runs-on: 'ubuntu-latest'
+    outputs:
+      image_tags: ${{ steps.meta.outputs.tags }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          sparse-checkout: |
+            .github/files/build/Dockerfile
+          sparse-checkout-cone-mode: false
+      - name: Download build artifact
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
+        with:
+          path: artifact
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d70bba72b1f3fd22344832f00baa16ece964efeb # v3.3.0
+        with:
+          version: ${{ env.BUILDX_VERSION }}
+      - name: Log in to the Container registry
+        uses: docker/login-action@0d4c9c5ea7693da7b068278f7b52bda2a190a446 # v3.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag-name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag-name }}
+            type=semver,pattern={{major}},value=${{ inputs.tag-name }},enable=${{ !(startsWith(github.ref, 'refs/tags/v0.') || startsWith(inputs.tag-name, 'v0.')) }}
+            type=edge
+            type=ref,event=branch
+            type=sha
+      - name: Build and push Docker image
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: .
+          file: .github/files/build/Dockerfile
+          platforms: darwin/amd64,darwin/arm64,linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
